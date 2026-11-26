@@ -208,6 +208,89 @@ def main() -> int:
     s, ov = call("GET", "/overview")
     check("总览可查询且块全部归卷", s == 200 and ov["unassigned_blocks"] == [])
 
+    # 11) 样卷校准：以已评分的 P9（91 分，B1/B2/B3）为样卷
+    s, samp = call("POST", "/samples", {
+        "paper_no": "P9", "teacher_ids": ["CAL1", "CAL2", "CAL3"]
+    })
+    check("登记样卷 200 且冻结参考分 91",
+          s == 200 and samp.get("reference_score") == 91 and samp.get("sample_id"))
+    sid = samp["sample_id"]
+
+    s, k1 = call("POST", "/claims", {"teacher_id": "CAL1"})
+    raw1 = json.dumps(k1, ensure_ascii=False).lower()
+    check("CAL1 原接口优先领到样卷（B1,B2,B3）",
+          s == 200 and [b["block_no"] for b in k1["blocks"]] == ["B1", "B2", "B3"])
+
+    def _forbidden_keys(obj):
+        bad = []
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                lk = str(k).lower()
+                if any(w in lk for w in ("sample", "reference", "calibrat", "ref_score")):
+                    bad.append(k)
+                bad += _forbidden_keys(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                bad += _forbidden_keys(v)
+        return bad
+
+    def _scalar_values(obj):
+        vals = []
+        if isinstance(obj, dict):
+            for v in obj.values():
+                vals += _scalar_values(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                vals += _scalar_values(v)
+        else:
+            vals.append(obj)
+        return vals
+
+    # 结构上不能出现样卷/参考分字段，也不能有数值等于参考分 91
+    _has_ref_value = any(
+        isinstance(v, (int, float)) and not isinstance(v, bool) and float(v) == 91.0
+        for v in _scalar_values(k1)
+    )
+    check("领取响应看不到样卷标记/参考分",
+          _forbidden_keys(k1) == [] and not _has_ref_value
+          and "sample" not in raw1.lower() and "reference" not in raw1.lower())
+
+    # 重复领取幂等返回同一号（并发时同样至多一个有效号）
+    s, k1b = call("POST", "/claims", {"teacher_id": "CAL1"})
+    check("重复领取返回同一领题号", s == 200 and k1b["claim_no"] == k1["claim_no"])
+
+    s, k2 = call("POST", "/claims", {"teacher_id": "CAL2"})
+    call("POST", f"/claims/{k1['claim_no']}/score", {"score": 85})
+    call("POST", f"/claims/{k2['claim_no']}/score", {"score": 95})
+    call("POST", f"/claims/{k2['claim_no']}/score", {"score": 94})  # 改分取最新
+
+    # CAL3：领取 -> 退回 -> 旧号失效 -> 领新号 -> 交分
+    s, k3 = call("POST", "/claims", {"teacher_id": "CAL3"})
+    old3 = k3["claim_no"]
+    call("POST", f"/claims/{old3}/release", expect=200)
+    s, _ = call("POST", f"/claims/{old3}/score", {"score": 1}, expect=409)
+    check("退回的样卷号码交分被拒", s == 409)
+    s, k3n = call("POST", "/claims", {"teacher_id": "CAL3"})
+    check("退回后可领新号", s == 200 and k3n["claim_no"] != old3)
+    call("POST", f"/claims/{k3n['claim_no']}/score", {"score": 91})
+
+    s, cal = call("GET", f"/samples/{sid}")
+    rows = {r["teacher_id"]: r for r in cal["results"]}
+    check("校准：CAL1=85 分差 -6", rows["CAL1"]["latest_score"] == 85
+          and rows["CAL1"]["score_diff"] == -6)
+    check("校准：CAL2 最新 94 分差 3（95 已被改分取代）",
+          rows["CAL2"]["latest_score"] == 94 and rows["CAL2"]["score_diff"] == 3)
+    check("校准：CAL3=91 分差 0", rows["CAL3"]["latest_score"] == 91
+          and rows["CAL3"]["score_diff"] == 0)
+
+    # 样卷评分不影响正式卷：P9 仍为正式分 91
+    _, p9now = call("GET", "/papers/P9")
+    check("样卷交分不影响 P9 正式分", p9now["score"] == 91)
+
+    # 别名路径可查分差
+    s, alias = call("GET", f"/calibration/samples/{sid}/scores")
+    check("校准别名路径可查", s == 200 and len(alias["scores"]) == 3)
+
     print(f"\n通过 {checks - len(failures)} 项检查，失败 {len(failures)} 项。")
     if failures:
         print("失败明细：")

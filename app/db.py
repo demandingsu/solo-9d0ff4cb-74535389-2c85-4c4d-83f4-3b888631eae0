@@ -60,12 +60,14 @@ CREATE INDEX IF NOT EXISTS idx_answer_status ON answer(status);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_active_answer_seq
     ON answer(seq_key) WHERE status = 'active';
 
--- 领题号。答案被作废时其全部领题号一并置 void。
+-- 领题号。答案被作废时其全部“普通”领题号一并置 void；
+-- sample_id 非空的是样卷校准领题号，独立于原答案生命周期，不被更正作废。
 CREATE TABLE IF NOT EXISTS claim (
     claim_no     INTEGER PRIMARY KEY AUTOINCREMENT,
     answer_id    TEXT NOT NULL REFERENCES answer(id),
     teacher_id   TEXT,
-    status       TEXT NOT NULL DEFAULT 'active', -- active | submitted | void
+    sample_id    INTEGER,                       -- 非空=样卷校准领取
+    status       TEXT NOT NULL DEFAULT 'active', -- active | submitted | released | void
     created_at   TEXT NOT NULL,
     submitted_at TEXT,
     released_at  TEXT,
@@ -73,6 +75,7 @@ CREATE TABLE IF NOT EXISTS claim (
     void_reason  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_claim_answer ON claim(answer_id);
+-- idx_claim_sample_teacher 在 _migrate 中创建（兼容旧库先补 sample_id 列）
 
 -- 评分流水：同一领题号重新交分以 superseded 保留旧记录，
 -- 更正作废时相关 valid 记录置 void，绝不物理删除“已入账评分”。
@@ -80,6 +83,7 @@ CREATE TABLE IF NOT EXISTS score (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     claim_no    INTEGER NOT NULL REFERENCES claim(claim_no),
     answer_id   TEXT NOT NULL REFERENCES answer(id),
+    sample_id   INTEGER,                        -- 非空=样卷校准分（不影响正式评分）
     score       REAL NOT NULL,
     comment     TEXT,
     revision    INTEGER NOT NULL DEFAULT 1,
@@ -90,6 +94,33 @@ CREATE TABLE IF NOT EXISTS score (
 );
 CREATE INDEX IF NOT EXISTS idx_score_claim ON score(claim_no);
 CREATE INDEX IF NOT EXISTS idx_score_answer ON score(answer_id);
+-- idx_score_sample 在 _migrate 中创建（兼容旧库先补 sample_id 列）
+
+-- 样卷校准：登记时冻结有序块序列、块内容快照与参考分。
+-- 之后原答案拆拼/正式改分/扫描块内容更新都不影响样卷继续评阅。
+CREATE TABLE IF NOT EXISTS sample_paper (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_no          TEXT NOT NULL,           -- 登记时选择的卷号（溯源用）
+    source_answer_id  TEXT,                    -- 登记时该卷的有效答案 id
+    seq_json          TEXT NOT NULL,           -- 冻结的有序块号
+    contents_json     TEXT NOT NULL DEFAULT '{}', -- 冻结的 {块号: 内容}
+    reference_score   REAL NOT NULL,           -- 登记时的正式分（参考分）
+    reference_comment TEXT,
+    status            TEXT NOT NULL DEFAULT 'active', -- active | revoked
+    created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sample_paper_paper ON sample_paper(paper_no);
+
+-- 参加校准的教师（每份样卷 × 每位教师一个席位）
+CREATE TABLE IF NOT EXISTS sample_teacher (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id   INTEGER NOT NULL REFERENCES sample_paper(id),
+    teacher_id  TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE(sample_id, teacher_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sample_teacher_teacher ON sample_teacher(teacher_id);
+CREATE INDEX IF NOT EXISTS idx_sample_teacher_sample ON sample_teacher(sample_id);
 
 -- 整批更正单（apply 直接生效；stage 先核对、稍后 apply）
 CREATE TABLE IF NOT EXISTS correction (
@@ -142,7 +173,13 @@ class Database:
     def _migrate(conn: sqlite3.Connection) -> None:
         """对早期版本的库做幂等补列（SQLite 不支持 ADD COLUMN IF NOT EXISTS）。"""
         additions = {
-            "claim": [("released_at", "TEXT")],
+            "claim": [
+                ("released_at", "TEXT"),
+                ("sample_id", "INTEGER"),
+            ],
+            "score": [
+                ("sample_id", "INTEGER"),
+            ],
         }
         for table, cols in additions.items():
             present = {
@@ -151,6 +188,23 @@ class Database:
             for name, decl in cols:
                 if name not in present:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+        # 同一样卷 × 同一教师至多有一个“有效领题号”（active/submitted）。
+        # 退回(released)/作废(void)后不在部分索引内，允许该教师领新号。
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_claim_sample_teacher "
+            "ON claim(sample_id, teacher_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_score_sample ON score(sample_id)"
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_live_sample_claim
+            ON claim(sample_id, teacher_id)
+            WHERE sample_id IS NOT NULL AND status IN ('active', 'submitted')
+            """
+        )
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:

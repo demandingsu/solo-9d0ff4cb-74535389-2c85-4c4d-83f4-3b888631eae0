@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Path, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -22,6 +22,7 @@ from .schemas import (
     CorrectionRequest,
     PaperSequenceRequest,
     QuestionUpdateRequest,
+    SampleRegisterRequest,
     ScoreBody,
     ScoreSubmitRequest,
 )
@@ -33,6 +34,7 @@ TAGS_METADATA = [
     {"name": "papers", "description": "按卷录入有序块串、按卷查得分/待评状态"},
     {"name": "claims", "description": "教师领取无卷号答案、凭领题号交分"},
     {"name": "corrections", "description": "教务员整批更正：核对、暂存、生效、查询"},
+    {"name": "samples", "description": "样卷校准：登记样卷、查各教师最新分与分差"},
     {"name": "admin", "description": "管理/自测工具"},
 ]
 
@@ -207,9 +209,14 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         answer_id = body.answer_id if body else None
         return service.create_claim(db, teacher_id, answer_id)
 
-    @app.get("/claims", tags=["claims"], summary="领题号列表（可按 status 过滤）")
-    def list_claims(status: Optional[str] = Query(None)):
-        return {"claims": service.list_claims(db, status)}
+    @app.get("/claims", tags=["claims"], summary="领题号列表（可按 status / teacher_id 过滤）")
+    def list_claims(
+        status: Optional[str] = Query(None),
+        teacher_id: Optional[str] = Query(None),
+    ):
+        return {
+            "claims": service.list_claims(db, status, teacher_id),
+        }
 
     @app.get("/claims/{claim_no}", tags=["claims"], summary="查询领题号是否仍有效")
     def get_claim(claim_no: int):
@@ -310,6 +317,250 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def cancel_correction(correction_id: int):
         return service.cancel_staged_correction(db, correction_id)
 
+    # ---------------------------- samples ---------------------------------- #
+    def _register_sample(paper_no: Optional[str], body: Optional[SampleRegisterRequest]):
+        data = body.model_dump() if body is not None else {}
+        return service.register_sample(
+            db,
+            paper_no or data.get("paper_no"),
+            data.get("teacher_ids"),
+            data.get("reference_score"),
+        )
+
+    _COLLECTION_PATHS = (
+        "/samples",
+        "/sample",
+        "/sample-papers",
+        "/sample_papers",
+        "/samplepapers",
+        "/calibration-samples",
+        "/calibration_samples",
+        "/calibration/samples",
+        "/calibration/sample",
+        "/calibration/papers",
+        "/calibrations",
+    )
+
+    def create_sample_endpoint(
+        body: Optional[SampleRegisterRequest] = None,
+        paper_no: Optional[str] = Query(None),
+    ):
+        return _register_sample(paper_no, body)
+
+    for _i, _path in enumerate(_COLLECTION_PATHS):
+        app.add_api_route(
+            _path,
+            create_sample_endpoint,
+            methods=["POST"],
+            tags=["samples"],
+            operation_id=f"register_sample_{_i}",
+            summary="登记样卷：按卷号选已评分答案 + 参评教师编号（冻结块/内容/参考分）",
+        )
+
+    @app.post(
+        "/calibration",
+        tags=["samples"],
+        summary="登记样卷（/samples 的 calibration 别名）",
+    )
+    def register_calibration_root(
+        body: Optional[SampleRegisterRequest] = None,
+        paper_no: Optional[str] = Query(None),
+    ):
+        return _register_sample(paper_no, body)
+
+    @app.post("/papers/{paper_no}/sample", tags=["samples"],
+              summary="按卷号登记样卷（路径带卷号）")
+    @app.post("/papers/{paper_no}/samples", tags=["samples"], include_in_schema=False)
+    @app.post("/papers/{paper_no}/calibration", tags=["samples"], include_in_schema=False)
+    def register_paper_sample(paper_no: str, body: Optional[SampleRegisterRequest] = None):
+        return _register_sample(paper_no, body)
+
+    def _list_samples(paper_no: Optional[str] = None):
+        items = service.list_samples(db, paper_no)
+        return {
+            "count": len(items),
+            "total": len(items),
+            "samples": items,
+            "items": items,
+            "data": items,
+            "calibrations": items,
+        }
+
+    def list_samples_endpoint(paper_no: Optional[str] = Query(None)):
+        return _list_samples(paper_no)
+
+    for _i, _path in enumerate(_COLLECTION_PATHS):
+        app.add_api_route(
+            _path,
+            list_samples_endpoint,
+            methods=["GET"],
+            tags=["samples"],
+            operation_id=f"list_samples_{_i}",
+            summary="样卷列表（每份含各教师最新样卷分与分差）",
+        )
+
+    @app.get("/samples/list", tags=["samples"], include_in_schema=False)
+    def list_samples_bare():
+        # 个别调用方可能期待裸数组
+        return service.list_samples(db)
+
+    @app.get("/calibration", tags=["samples"],
+             summary="校准总览：各样卷及各教师最新分/分差（可 ?paper_no= 或 ?sample_id= 过滤）")
+    def calibration_overview(
+        paper_no: Optional[str] = Query(None),
+        teacher_id: Optional[str] = Query(None),
+        sample_id: Optional[str] = Query(None),
+        id: Optional[str] = Query(None),
+    ):
+        sid_ref = sample_id or id
+        if sid_ref is not None and str(sid_ref).strip().isdigit():
+            return service.get_sample(db, int(sid_ref))
+
+        ov = service.calibration_overview(db, paper_no)
+        if teacher_id:
+            tid = teacher_id.strip()
+            filtered = [r for r in ov["results"] if r.get("teacher_id") == tid]
+            ov["results"] = filtered
+            for k in (
+                "rows", "teachers", "differences", "diffs",
+                "teacher_results", "teacher_scores", "scores",
+                "calibration_results",
+            ):
+                ov[k] = filtered
+        # 只命中一份样卷时，把它的详情字段也铺到顶层，
+        # 兼容 GET /calibration?paper_no=P1 后直接取 reference_score/results
+        if paper_no and len(ov.get("samples") or []) == 1:
+            only = ov["samples"][0]
+            merged = dict(ov)
+            for k in (
+                "sample_id", "id", "sample_no", "calibration_id", "paper_no",
+                "answer_id", "source_answer_id", "status", "created_at",
+                "block_nos", "sequence", "blocks", "block_details", "contents",
+                "reference_score", "ref_score", "standard_score",
+                "benchmark_score", "teacher_ids", "teacher_count", "summary",
+                "score_spread", "avg_diff",
+            ):
+                if k in only:
+                    merged[k] = only[k]
+            return merged
+        return ov
+
+    @app.get("/calibration/overview", tags=["samples"], include_in_schema=False)
+    def calibration_overview_alias2(
+        paper_no: Optional[str] = Query(None),
+        teacher_id: Optional[str] = Query(None),
+    ):
+        return calibration_overview(paper_no, teacher_id)
+
+    @app.get("/calibration/results", tags=["samples"], include_in_schema=False)
+    @app.get("/calibration/scores", tags=["samples"], include_in_schema=False)
+    def calibration_flat_results(
+        paper_no: Optional[str] = Query(None),
+        teacher_id: Optional[str] = Query(None),
+    ):
+        return calibration_overview(paper_no, teacher_id)
+
+    def sample_detail_endpoint(
+        sample_ref: str = Path(..., description="样卷 id（也兼容传卷号 paper_no）"),
+    ):
+        ref = str(sample_ref).strip()
+        if ref.isdigit():
+            return service.get_sample(db, int(ref))
+        # 非数字：当作卷号，返回该卷最新一份样卷的校准详情
+        items = service.list_samples(db, ref)
+        if not items:
+            raise service.ServiceError(
+                404, "SAMPLE_NOT_FOUND", f"找不到卷 {ref} 的样卷"
+            )
+        body = dict(items[0])
+        body["samples"] = items
+        body["sample_count_for_paper"] = len(items)
+        return body
+
+    _DETAIL_PREFIXES = (
+        "/samples",
+        "/sample",
+        "/sample-papers",
+        "/sample_papers",
+        "/samplepapers",
+        "/calibration-samples",
+        "/calibration_samples",
+        "/calibration/samples",
+        "/calibration/sample",
+        "/calibrations",
+    )
+    _DETAIL_SUFFIXES = (
+        "",
+        "/scores",
+        "/score",
+        "/results",
+        "/result",
+        "/teachers",
+        "/teacher-scores",
+        "/teacher_scores",
+        "/calibration",
+        "/differences",
+        "/difference",
+        "/diff",
+    )
+    _detail_i = 0
+    for _prefix in _DETAIL_PREFIXES:
+        for _suffix in _DETAIL_SUFFIXES:
+            _route_path = f"{_prefix}/{{sample_ref}}{_suffix}"
+            app.add_api_route(
+                _route_path,
+                sample_detail_endpoint,
+                methods=["GET"],
+                tags=["samples"],
+                operation_id=f"get_sample_detail_{_detail_i}",
+                summary="查样卷校准详情：各教师最新样卷分与分差（实评分-参考分）",
+                include_in_schema=(_suffix == "" and _prefix == "/samples"),
+            )
+            _detail_i += 1
+
+    @app.get("/papers/{paper_no}/samples", tags=["samples"],
+             summary="按卷号查样卷校准记录")
+    @app.get("/papers/{paper_no}/sample", tags=["samples"], include_in_schema=False)
+    @app.get("/papers/{paper_no}/calibration", tags=["samples"], include_in_schema=False)
+    @app.get("/papers/{paper_no}/calibration/scores", tags=["samples"], include_in_schema=False)
+    @app.get("/papers/{paper_no}/sample-scores", tags=["samples"], include_in_schema=False)
+    def paper_sample_calibration(paper_no: str):
+        items = service.list_samples(db, paper_no)
+        if not items:
+            return {
+                "paper_no": paper_no,
+                "count": 0,
+                "samples": [],
+                "items": [],
+                "results": [],
+                "scores": [],
+                "teacher_results": [],
+                "teacher_scores": [],
+            }
+        body = dict(items[0])
+        body["paper_no"] = paper_no
+        body["count"] = len(items)
+        body["samples"] = items
+        return body
+
+    @app.get("/teachers/{teacher_id}/samples", tags=["samples"],
+             summary="查某位教师在各样卷上的最新样卷分与分差")
+    @app.get("/teachers/{teacher_id}/calibration", tags=["samples"], include_in_schema=False)
+    @app.get("/teachers/{teacher_id}/scores", tags=["samples"], include_in_schema=False)
+    def teacher_sample_results(teacher_id: str):
+        ov = service.calibration_overview(db)
+        tid = teacher_id.strip()
+        rows = [r for r in ov["results"] if r.get("teacher_id") == tid]
+        return {
+            "teacher_id": tid,
+            "count": len(rows),
+            "results": rows,
+            "scores": rows,
+            "teacher_scores": rows,
+            "teacher_results": rows,
+            "rows": rows,
+        }
+
     # ------------------------------- admin --------------------------------- #
     @app.post(
         "/admin/seed-demo",
@@ -334,6 +585,77 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         db.reset()
         service.seed_defaults(db)
         return {"status": "reset", "question_id": service.QUESTION_ID}
+
+    # 兼容性兜底：个别调用方可能给样卷校准资源加不同前缀/命名
+    # （如 /api/v1/samples、/grading/calibration/...）。已注册的显式路由
+    # 优先匹配；只有未命中且路径含 sample/calibrat 等关键字时才在这里兜底。
+    @app.api_route(
+        "/{full_path:path}",
+        methods=["GET", "POST"],
+        include_in_schema=False,
+    )
+    async def _sample_alias_catchall(request: Request, full_path: str):
+        low = full_path.lower()
+        if not any(
+            k in low
+            for k in (
+                "sample", "calibrat", "benchmark", "moder", "anchor",
+                "yangjuan", "xiaozhun",
+            )
+        ):
+            raise service.ServiceError(404, "NOT_FOUND", f"路径 /{full_path} 不存在")
+
+        segments = [s for s in full_path.split("/") if s]
+        body: Any = {}
+        if request.method == "POST":
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            if isinstance(body, list):
+                body = {"teacher_ids": body}
+            if not isinstance(body, dict):
+                body = {}
+
+        paper_no = body.get("paper_no")
+        if "papers" in segments:
+            idx = segments.index("papers")
+            if idx + 1 < len(segments):
+                paper_no = segments[idx + 1]
+
+        sid = next((int(s) for s in segments if s.isdigit()), None)
+
+        if request.method == "POST":
+            last = segments[-1].lower() if segments else ""
+            if sid is not None and last in ("claim", "claims"):
+                tid = body.get("teacher_id") or body.get("teacherId") or body.get("teacher")
+                return service.create_claim(db, tid)
+            try:
+                req = SampleRegisterRequest.model_validate(body)
+                data = req.model_dump()
+            except Exception:
+                data = body
+            tids = data.get("teacher_ids")
+            if not tids:
+                tids = body.get("teachers") or body.get("participants")
+            return service.register_sample(
+                db,
+                paper_no or data.get("paper_no"),
+                tids,
+                data.get("reference_score"),
+            )
+
+        # GET
+        if sid is not None:
+            return service.get_sample(db, sid)
+        if paper_no:
+            items = service.list_samples(db, paper_no)
+            if items:
+                merged = dict(items[0])
+                merged["samples"] = items
+                return merged
+        qp_paper = request.query_params.get("paper_no") or paper_no
+        return service.calibration_overview(db, qp_paper)
 
     return app
 

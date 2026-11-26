@@ -313,3 +313,114 @@ class ScoreSubmitRequest(ScoreBody):
 class QuestionUpdateRequest(BaseModel):
     name: Optional[str] = Field(None, examples=["高二数学 第18题"])
     full_score: Optional[float] = Field(None, examples=[12.0])
+
+
+_TEACHER_IDS_KEYS = (
+    "teacher_ids",
+    "teacherIds",
+    "teacher_id_list",
+    "teacher_nos",
+    "teacherNos",
+    "teacher_id",
+    "teacherId",
+    "teacher",
+    "teachers",
+    "teacher_list",
+    "participants",
+    "participant_ids",
+    "grading_teachers",
+    "grader_ids",
+    "graderIds",
+    "graders",
+    "工号",
+    "教师编号",
+    "教师ids",
+    "教师ID",
+)
+_REF_SCORE_KEYS = (
+    "reference_score",
+    "ref_score",
+    "referenceScore",
+    "standard_score",
+    "benchmark_score",
+    "reference",
+    "ref",
+    "参考分",
+)
+
+
+class SampleRegisterRequest(BaseModel):
+    """登记样卷：按卷号选已评分答案 + 参评教师编号。
+
+    兼容多种别名字段；请求体也可以直接是教师编号数组。
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        json_schema_extra={
+            "example": {
+                "paper_no": "P1",
+                "teacher_ids": ["T001", "T002", "T003"],
+            }
+        },
+    )
+
+    paper_no: Optional[str] = Field(
+        None, description="已评分的卷号", examples=["P1"]
+    )
+    teacher_ids: list[Any] = Field(
+        default_factory=list,
+        description="参加校准的教师编号列表",
+        examples=[["T001", "T002", "T003"]],
+    )
+    reference_score: Optional[float] = Field(
+        None,
+        description="一般不传：默认取登记时该卷的正式得分作为参考分",
+        examples=[88.0],
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, data: Any) -> Any:
+        # 裸数组：["T1","T2"]
+        if isinstance(data, list):
+            return {"teacher_ids": data}
+        if data is None:
+            return {}
+        if not isinstance(data, dict):
+            return data
+
+        out = dict(data)
+
+        # 兼容 {"sample": {...}} / {"calibration": {...}} 的嵌套包装
+        for wrap_key in ("sample", "calibration", "data"):
+            inner = out.get(wrap_key)
+            if isinstance(inner, dict):
+                merged = {**inner, **{k: v for k, v in out.items() if k != wrap_key}}
+                out = merged
+                break
+
+        if not out.get("paper_no"):
+            pn = pick_key(out, _PAPER_KEYS)
+            if pn is not None:
+                out["paper_no"] = str(pn).strip()
+        elif out.get("paper_no") is not None:
+            out["paper_no"] = str(out["paper_no"]).strip()
+
+        if not out.get("teacher_ids"):
+            raw = pick_key(out, _TEACHER_IDS_KEYS)
+            if raw is not None:
+                if isinstance(raw, str):
+                    out["teacher_ids"] = as_str_list(raw)
+                elif isinstance(raw, (list, tuple)):
+                    out["teacher_ids"] = list(raw)
+                else:
+                    out["teacher_ids"] = [raw]
+        elif isinstance(out["teacher_ids"], str):
+            out["teacher_ids"] = as_str_list(out["teacher_ids"])
+
+        if out.get("reference_score") is None:
+            ref = pick_key(out, _REF_SCORE_KEYS)
+            if ref is not None:
+                out["reference_score"] = ref
+        return out

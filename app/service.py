@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import math
+import sqlite3
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
@@ -159,7 +160,11 @@ def seed_defaults(db: Database) -> None:
 
 
 def seed_demo(db: Database) -> dict[str, Any]:
-    """写入一套固定演示数据（幂等、追加，不清空已有数据）。"""
+    """写入一套固定演示数据（幂等、追加，不清空已有数据）。
+
+    额外把 DEMO-P1 正式评分为 86，并登记一份带三位教师的样卷校准，
+    其中两位已交样卷分，方便打开 /docs 直接查看分差。
+    """
     blocks = [
         {"block_no": f"DB{i}", "content": f"演示：第1题扫描块 {i} 的作答内容"}
         for i in range(1, 7)
@@ -173,10 +178,46 @@ def seed_demo(db: Database) -> dict[str, Any]:
             {"paper_no": "DEMO-P3", "blocks": ["DB6"]},
         ],
     )
+
+    # 让 DEMO-P1 有一个正式分 86（参考分来源），重复调用不重复造分
+    p1 = paper_detail(db, "DEMO-P1")
+    if p1.get("status") != "scored":
+        cno = p1.get("claim_no")
+        if cno is None:
+            claim = create_claim(db, "DEMO-GRADER", p1.get("answer_id"))
+            cno = claim["claim_no"]
+        submit_score(db, cno, 86.0, "演示正式评分（参考分来源）")
+
+    # 幂等登记样卷：已存在 DEMO-P1 的样卷就不再重复登记/打分
+    existing = list_samples(db, "DEMO-P1")
+    if existing:
+        sample = existing[0]
+    else:
+        sample = register_sample(
+            db, "DEMO-P1", ["DEMO-T1", "DEMO-T2", "DEMO-T3"]
+        )
+        c1 = create_claim(db, "DEMO-T1")["claim_no"]
+        submit_score(db, c1, 82.0, "演示样卷分（偏低）")
+        c2 = create_claim(db, "DEMO-T2")["claim_no"]
+        submit_score(db, c2, 91.0, "演示样卷分（偏高）")
+        sample = get_sample(db, sample["sample_id"])
+
     return {
         "seeded": True,
-        "hint": "现在可 POST /claims 领取答案，再 POST /claims/{claim_no}/score 交分",
+        "hint": (
+            "可 POST /claims {\"teacher_id\":\"DEMO-T3\"} 体验领样卷；"
+            "GET /samples 或 /samples/"
+            + str(sample["sample_id"])
+            + " 查看各教师最新样卷分与分差"
+        ),
         "papers": result["papers"],
+        "sample": {
+            "sample_id": sample["sample_id"],
+            "paper_no": "DEMO-P1",
+            "reference_score": sample["reference_score"],
+            "calibration_path": f"/samples/{sample['sample_id']}",
+            "teacher_ids": sample["teacher_ids"],
+        },
     }
 
 
@@ -458,25 +499,27 @@ def _void_answer_conn(
         """
         UPDATE claim
         SET status='void', voided_at=?, void_reason=?
-        WHERE answer_id=? AND status <> 'void'
+        WHERE answer_id=? AND status <> 'void' AND sample_id IS NULL
         """,
         (ts, reason, answer_id),
     )
+    # 样卷校准分独立于正式评分，不随原答案更正作废
     conn.execute(
         """
         UPDATE score
         SET status='void', voided_at=?, void_reason=?
-        WHERE answer_id=? AND status='valid'
+        WHERE answer_id=? AND status='valid' AND sample_id IS NULL
         """,
         (ts, reason, answer_id),
     )
 
 
 def _live_claim_conn(conn, answer_id: str) -> Optional[Any]:
+    # 只看正式领取；样卷领取不计入试卷当前领题号
     return conn.execute(
         """
         SELECT * FROM claim
-        WHERE answer_id=? AND status IN ('active','submitted')
+        WHERE answer_id=? AND status IN ('active','submitted') AND sample_id IS NULL
         ORDER BY claim_no DESC LIMIT 1
         """,
         (answer_id,),
@@ -484,10 +527,11 @@ def _live_claim_conn(conn, answer_id: str) -> Optional[Any]:
 
 
 def _valid_score_conn(conn, answer_id: str) -> Optional[Any]:
+    # 样卷校准分不是正式评分，不能成为试卷当前得分
     return conn.execute(
         """
         SELECT * FROM score
-        WHERE answer_id=? AND status='valid'
+        WHERE answer_id=? AND status='valid' AND sample_id IS NULL
         ORDER BY id DESC LIMIT 1
         """,
         (answer_id,),
@@ -638,16 +682,33 @@ def _claim_dict_conn(conn, claim_row) -> dict[str, Any]:
     answer = conn.execute(
         "SELECT * FROM answer WHERE id=?", (claim_row["answer_id"],)
     ).fetchone()
-    block_nos = parse_seq(answer["seq_json"]) if answer else []
 
-    contents = {}
-    if block_nos:
-        ph = ",".join("?" for _ in block_nos)
-        for r in conn.execute(
-            f"SELECT block_no, content FROM block WHERE block_no IN ({ph})",
-            block_nos,
-        ):
-            contents[r["block_no"]] = r["content"]
+    sample_id = claim_row["sample_id"] if "sample_id" in claim_row.keys() else None
+    if sample_id is not None:
+        # 样卷领取：块序列与文字内容一律用登记时冻结的快照，
+        # 不随原答案更正或扫描块内容更新而变化。
+        sample = conn.execute(
+            "SELECT * FROM sample_paper WHERE id=?", (sample_id,)
+        ).fetchone()
+        if sample is not None:
+            block_nos = parse_seq(sample["seq_json"])
+            try:
+                contents = json.loads(sample["contents_json"] or "{}")
+            except (TypeError, ValueError):
+                contents = {}
+        else:
+            block_nos = parse_seq(answer["seq_json"]) if answer else []
+            contents = {}
+    else:
+        block_nos = parse_seq(answer["seq_json"]) if answer else []
+        contents = {}
+        if block_nos:
+            ph = ",".join("?" for _ in block_nos)
+            for r in conn.execute(
+                f"SELECT block_no, content FROM block WHERE block_no IN ({ph})",
+                block_nos,
+            ):
+                contents[r["block_no"]] = r["content"]
 
     blocks = [
         {
@@ -684,6 +745,73 @@ def _claim_dict_conn(conn, claim_row) -> dict[str, Any]:
     return data
 
 
+def _claim_own_sample_conn(conn, tid: str, ts: str) -> Optional[Any]:
+    """教师普通领题时的“样卷优先”分支。
+
+    - 若该教师在某份样卷中还有无有效领题号的席位：领取一个新样卷号；
+    - 若所有样卷席位都已有有效领题号：幂等返回最近的有效样卷领题号，
+      保证并发领取同一份样卷时每位教师至多得到一个有效号（并发请求
+      会收敛到同一个 claim_no）；
+    - 若该教师没有任何样卷席位/有效样卷号：返回 None，走普通领取队列。
+    """
+    sample = conn.execute(
+        """
+        SELECT sp.*
+        FROM sample_teacher st
+        JOIN sample_paper sp ON sp.id = st.sample_id
+        WHERE st.teacher_id = ?
+          AND sp.status = 'active'
+          AND NOT EXISTS (
+              SELECT 1 FROM claim c
+              WHERE c.sample_id = sp.id
+                AND c.teacher_id = st.teacher_id
+                AND c.status IN ('active', 'submitted')
+          )
+        ORDER BY sp.id ASC, st.id ASC
+        LIMIT 1
+        """,
+        (tid,),
+    ).fetchone()
+
+    if sample is not None:
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO claim(answer_id, teacher_id, sample_id,
+                                   status, created_at)
+                VALUES (?, ?, ?, 'active', ?)
+                """,
+                (sample["source_answer_id"], tid, sample["id"], ts),
+            )
+        except sqlite3.IntegrityError:
+            # 并发兜底：唯一部分索引说明已有有效号，改为幂等返回它
+            existing = conn.execute(
+                """
+                SELECT * FROM claim
+                WHERE sample_id=? AND teacher_id=?
+                  AND status IN ('active', 'submitted')
+                ORDER BY claim_no DESC LIMIT 1
+                """,
+                (sample["id"], tid),
+            ).fetchone()
+            if existing is not None:
+                return existing
+            raise
+        return conn.execute(
+            "SELECT * FROM claim WHERE claim_no=?", (cur.lastrowid,)
+        ).fetchone()
+
+    return conn.execute(
+        """
+        SELECT * FROM claim
+        WHERE teacher_id=? AND sample_id IS NOT NULL
+          AND status IN ('active', 'submitted')
+        ORDER BY claim_no DESC LIMIT 1
+        """,
+        (tid,),
+    ).fetchone()
+
+
 def create_claim(
     db: Database,
     teacher_id: Optional[str],
@@ -693,6 +821,12 @@ def create_claim(
     aid = answer_id.strip() if isinstance(answer_id, str) and answer_id.strip() else None
     ts = now_iso()
     with db.tx() as conn:
+        # 普通领题（未指定 answer_id）且带教师编号：优先领自己的样卷
+        if aid is None and tid is not None:
+            sample_claim = _claim_own_sample_conn(conn, tid, ts)
+            if sample_claim is not None:
+                return _claim_dict_conn(conn, sample_claim)
+
         if aid is not None:
             answer = conn.execute(
                 """
@@ -700,11 +834,14 @@ def create_claim(
                 WHERE a.id=? AND a.status='active' AND a.seq_key <> '[]'
                   AND NOT EXISTS (
                       SELECT 1 FROM claim c
-                      WHERE c.answer_id=a.id AND c.status IN ('active','submitted')
+                      WHERE c.answer_id=a.id
+                        AND c.status IN ('active','submitted')
+                        AND c.sample_id IS NULL
                   )
                   AND NOT EXISTS (
                       SELECT 1 FROM score s
                       WHERE s.answer_id=a.id AND s.status='valid'
+                        AND s.sample_id IS NULL
                   )
                 """,
                 (aid,),
@@ -730,11 +867,14 @@ def create_claim(
                   AND a.seq_key <> '[]'
                   AND NOT EXISTS (
                       SELECT 1 FROM claim c
-                      WHERE c.answer_id=a.id AND c.status IN ('active','submitted')
+                      WHERE c.answer_id=a.id
+                        AND c.status IN ('active','submitted')
+                        AND c.sample_id IS NULL
                   )
                   AND NOT EXISTS (
                       SELECT 1 FROM score s
                       WHERE s.answer_id=a.id AND s.status='valid'
+                        AND s.sample_id IS NULL
                   )
                 ORDER BY a.rowid ASC
                 LIMIT 1
@@ -770,12 +910,22 @@ def get_claim(db: Database, claim_no: int) -> dict[str, Any]:
         return _claim_dict_conn(conn, row)
 
 
-def list_claims(db: Database, status_filter: Optional[str] = None) -> list[dict[str, Any]]:
+def list_claims(
+    db: Database,
+    status_filter: Optional[str] = None,
+    teacher_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
     q = "SELECT * FROM claim"
+    clauses: list[str] = []
     params: list[Any] = []
     if status_filter:
-        q += " WHERE status=?"
+        clauses.append("status=?")
         params.append(status_filter)
+    if teacher_id:
+        clauses.append("teacher_id=?")
+        params.append(teacher_id.strip())
+    if clauses:
+        q += " WHERE " + " AND ".join(clauses)
     q += " ORDER BY claim_no DESC"
     with db.read() as conn:
         return [_claim_dict_conn(conn, r) for r in conn.execute(q, params).fetchall()]
@@ -875,11 +1025,19 @@ def submit_score(
         )
         cur = conn.execute(
             """
-            INSERT INTO score(claim_no, answer_id, score, comment,
+            INSERT INTO score(claim_no, answer_id, sample_id, score, comment,
                                revision, status, created_at)
-            VALUES (?, ?, ?, ?, ?, 'valid', ?)
+            VALUES (?, ?, ?, ?, ?, ?, 'valid', ?)
             """,
-            (cno, claim["answer_id"], score, comment, revision, ts),
+            (
+                cno,
+                claim["answer_id"],
+                claim["sample_id"] if "sample_id" in claim.keys() else None,
+                score,
+                comment,
+                revision,
+                ts,
+            ),
         )
         conn.execute(
             "UPDATE claim SET status='submitted', submitted_at=? WHERE claim_no=?",
@@ -1094,11 +1252,11 @@ def _build_plan_conn(conn, norm: list[dict[str, Any]]) -> dict[str, Any]:
         old_blocks = parse_seq(old["seq_json"])
         reason = _void_reason(old_blocks, norm)
         claim_rows = conn.execute(
-            "SELECT claim_no FROM claim WHERE answer_id=? AND status<>'void'",
+            "SELECT claim_no FROM claim WHERE answer_id=? AND status<>'void' AND sample_id IS NULL",
             (old["id"],),
         ).fetchall()
         score_rows = conn.execute(
-            "SELECT id, score FROM score WHERE answer_id=? AND status='valid'",
+            "SELECT id, score FROM score WHERE answer_id=? AND status='valid' AND sample_id IS NULL",
             (old["id"],),
         ).fetchall()
         voided.append(
@@ -1367,3 +1525,480 @@ def cancel_staged_correction(db: Database, correction_id: int) -> dict[str, Any]
             (correction_id,),
         )
         return {"correction_id": correction_id, "status": "cancelled"}
+
+
+# --------------------------------------------------------------------------- #
+# 样卷校准：登记快照 / 教师席位 / 最新样卷分与分差
+# --------------------------------------------------------------------------- #
+
+_TEACHER_KEYS = (
+    "teacher_id",
+    "teacherId",
+    "teacher_no",
+    "teacherNo",
+    "teacher",
+    "id",
+    "工号",
+    "教师编号",
+    "教师号",
+)
+
+
+def normalize_teacher_ids(raw: Any) -> list[str]:
+    """把教师编号入参归一成去重、去空白的字符串列表（保持顺序）。"""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        import re
+
+        items: list[Any] = [p for p in re.split(r"[,，、;；\s]+", raw.strip()) if p]
+    elif isinstance(raw, dict):
+        val = None
+        for k in _TEACHER_KEYS:
+            if raw.get(k) is not None:
+                val = raw[k]
+                break
+        items = [] if val is None else [val]
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        items = [raw]
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for it in items:
+        if isinstance(it, dict):
+            tid = None
+            for k in _TEACHER_KEYS:
+                if it.get(k) is not None:
+                    tid = it[k]
+                    break
+            it = tid
+        if it is None:
+            continue
+        tid = str(it).strip()
+        if tid and tid not in seen:
+            seen.add(tid)
+            out.append(tid)
+    return out
+
+
+def _round_diff(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    # 消除 92.3-90.1=2.1999999999999993 之类的浮点噪声
+    return round(float(value), 10)
+
+
+def register_sample(
+    db: Database,
+    paper_no: Optional[str],
+    teacher_ids_raw: Any,
+    reference_score: Optional[float] = None,
+) -> dict[str, Any]:
+    """教务按卷号选择一份已评分答案登记样卷，并指定参评教师。
+
+    登记时冻结：有序扫描块序列、各块文字内容、当前正式分（参考分）。
+    """
+    pno = str(paper_no or "").strip()
+    if not pno:
+        raise ServiceError(422, "EMPTY_PAPER_NO", "卷号不能为空")
+
+    teacher_ids = normalize_teacher_ids(teacher_ids_raw)
+    if not teacher_ids:
+        raise ServiceError(
+            422,
+            "NO_TEACHER_IDS",
+            "登记样卷至少需要一位参加教师 teacher_ids",
+        )
+
+    override_ref: Optional[float] = None
+    if reference_score is not None:
+        if isinstance(reference_score, bool) or not isinstance(
+            reference_score, (int, float)
+        ):
+            raise ServiceError(422, "INVALID_REFERENCE_SCORE", "参考分必须是数值")
+        override_ref = float(reference_score)
+        if not math.isfinite(override_ref) or override_ref < 0:
+            raise ServiceError(
+                422, "SCORE_OUT_OF_RANGE", "参考分必须是有限的非负数值"
+            )
+
+    ts = now_iso()
+    with db.tx() as conn:
+        # 复用试卷详情：卷不存在抛 PAPER_NOT_FOUND；score 已排除样卷分
+        detail = _paper_detail_conn(conn, pno)
+        if detail.get("status") != "scored" or detail.get("score") is None:
+            raise ServiceError(
+                409,
+                "PAPER_NOT_SCORED",
+                f"卷 {pno} 当前不是已评分答案，不能登记为样卷；请先正式评分",
+                details={
+                    "paper_no": pno,
+                    "status": detail.get("status"),
+                    "grading_status": detail.get("grading_status"),
+                },
+            )
+
+        answer_id = detail.get("answer_id")
+        blocks = list(detail.get("blocks") or [])
+        ref_score = override_ref if override_ref is not None else float(detail["score"])
+        ref_comment = detail.get("comment")
+
+        contents: dict[str, Optional[str]] = {}
+        if blocks:
+            ph = ",".join("?" for _ in blocks)
+            for r in conn.execute(
+                f"SELECT block_no, content FROM block WHERE block_no IN ({ph})",
+                blocks,
+            ):
+                contents[r["block_no"]] = r["content"]
+
+        cur = conn.execute(
+            """
+            INSERT INTO sample_paper(
+                paper_no, source_answer_id, seq_json, contents_json,
+                reference_score, reference_comment, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
+            """,
+            (
+                pno,
+                answer_id,
+                seq_key(blocks),
+                json.dumps(contents, ensure_ascii=False),
+                ref_score,
+                ref_comment,
+                ts,
+            ),
+        )
+        sid = cur.lastrowid
+        for tid in teacher_ids:
+            conn.execute(
+                """
+                INSERT INTO sample_teacher(sample_id, teacher_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (sid, tid, ts),
+            )
+        return _sample_detail_conn(conn, sid)
+
+
+# 常见命名的服务层别名
+create_sample = register_sample
+add_sample = register_sample
+register_calibration_sample = register_sample
+
+
+def _sample_teacher_rows_conn(
+    conn, sample_id: int, reference_score: float
+) -> list[dict[str, Any]]:
+    seats = conn.execute(
+        "SELECT * FROM sample_teacher WHERE sample_id=? ORDER BY id ASC",
+        (sample_id,),
+    ).fetchall()
+
+    rows: list[dict[str, Any]] = []
+    for seat in seats:
+        tid = seat["teacher_id"]
+        claim = conn.execute(
+            """
+            SELECT * FROM claim
+            WHERE sample_id=? AND teacher_id=?
+              AND status IN ('active', 'submitted')
+            ORDER BY claim_no DESC LIMIT 1
+            """,
+            (sample_id, tid),
+        ).fetchone()
+        score = conn.execute(
+            """
+            SELECT s.* FROM score s
+            JOIN claim c ON c.claim_no = s.claim_no
+            WHERE c.sample_id=? AND c.teacher_id=? AND s.status='valid'
+            ORDER BY s.id DESC LIMIT 1
+            """,
+            (sample_id, tid),
+        ).fetchone()
+        last_claim = conn.execute(
+            """
+            SELECT claim_no, status FROM claim
+            WHERE sample_id=? AND teacher_id=?
+            ORDER BY claim_no DESC LIMIT 1
+            """,
+            (sample_id, tid),
+        ).fetchone()
+
+        if score is not None:
+            latest = float(score["score"])
+            diff = _round_diff(latest - float(reference_score))
+            grading_status = "scored"
+            status = "submitted"
+            claim_no: Optional[int] = score["claim_no"]
+            submitted_at = score["created_at"]
+            revision = score["revision"]
+            comment = score["comment"]
+        elif claim is not None and claim["status"] == "active":
+            latest = None
+            diff = None
+            grading_status = "claimed"
+            status = "active"
+            claim_no = claim["claim_no"]
+            submitted_at = None
+            revision = None
+            comment = None
+        elif claim is not None:  # submitted 但暂无 valid 分（理论上少见）
+            latest = None
+            diff = None
+            grading_status = "claimed"
+            status = claim["status"]
+            claim_no = claim["claim_no"]
+            submitted_at = claim["submitted_at"]
+            revision = None
+            comment = None
+        else:
+            latest = None
+            diff = None
+            grading_status = "unclaimed"
+            status = "pending"
+            claim_no = None
+            submitted_at = None
+            revision = None
+            comment = None
+
+        rows.append(
+            {
+                "teacher_id": tid,
+                "sample_id": sample_id,
+                # 各种可能的“状态/领题号”命名
+                "claim_no": claim_no,
+                "active_claim_no": claim["claim_no"] if claim is not None else None,
+                "last_claim_no": last_claim["claim_no"] if last_claim else None,
+                "claim_status": claim["status"] if claim is not None else None,
+                "last_claim_status": last_claim["status"] if last_claim else None,
+                "status": status,
+                "grading_status": grading_status,
+                "state": grading_status,
+                # 教师最新样卷分（多给几个字段名）
+                "latest_score": latest,
+                "score": latest,
+                "actual_score": latest,
+                "teacher_score": latest,
+                "sample_score": latest,
+                "final_score": latest,
+                "last_score": latest,
+                "newest_score": latest,
+                "current_score": latest,
+                "latest": latest,
+                "value": latest,
+                "revision": revision,
+                "comment": comment,
+                "submitted_at": submitted_at,
+                "scored_at": submitted_at if score is not None else None,
+                # 参考分与分差（实评分 - 参考分）
+                "reference_score": float(reference_score),
+                "ref_score": float(reference_score),
+                "standard_score": float(reference_score),
+                "benchmark_score": float(reference_score),
+                "score_diff": diff,
+                "diff": diff,
+                "difference": diff,
+                "score_difference": diff,
+                "difference_score": diff,
+                "diff_score": diff,
+                "score_delta": diff,
+                "delta": diff,
+                "deviation": diff,
+                "gap": diff,
+                "score_gap": diff,
+                "diff_from_reference": diff,
+                "reference_diff": diff,
+                "actual_minus_reference": diff,
+            }
+        )
+    return rows
+
+
+def _sample_detail_conn(conn, sample_id: int) -> dict[str, Any]:
+    sp = conn.execute(
+        "SELECT * FROM sample_paper WHERE id=?", (sample_id,)
+    ).fetchone()
+    if sp is None:
+        raise ServiceError(
+            404, "SAMPLE_NOT_FOUND", f"找不到样卷 {sample_id}"
+        )
+
+    block_nos = parse_seq(sp["seq_json"])
+    try:
+        contents = json.loads(sp["contents_json"] or "{}")
+    except (TypeError, ValueError):
+        contents = {}
+    block_details = [
+        {
+            "position": i,
+            "block_no": bn,
+            "content": contents.get(bn),
+        }
+        for i, bn in enumerate(block_nos)
+    ]
+
+    rows = _sample_teacher_rows_conn(conn, sample_id, sp["reference_score"])
+    teacher_ids = [r["teacher_id"] for r in rows]
+    scored_values = [r["latest_score"] for r in rows if r["latest_score"] is not None]
+    diffs = [r["score_diff"] for r in rows if r["score_diff"] is not None]
+
+    summary = {
+        "teacher_count": len(rows),
+        "scored_count": len(scored_values),
+        "pending_count": len(rows) - len(scored_values),
+        "unclaimed_count": sum(1 for r in rows if r["grading_status"] == "unclaimed"),
+        "claimed_count": sum(1 for r in rows if r["grading_status"] == "claimed"),
+        "latest_scores": scored_values,
+        "max_score": max(scored_values) if scored_values else None,
+        "min_score": min(scored_values) if scored_values else None,
+        "score_spread": _round_diff(max(scored_values) - min(scored_values))
+        if len(scored_values) >= 2
+        else (0.0 if len(scored_values) == 1 else None),
+        "avg_score": _round_diff(sum(scored_values) / len(scored_values))
+        if scored_values
+        else None,
+        "max_diff": max(diffs) if diffs else None,
+        "min_diff": min(diffs) if diffs else None,
+        "diff_spread": _round_diff(max(diffs) - min(diffs)) if len(diffs) >= 2 else None,
+        "avg_diff": _round_diff(sum(diffs) / len(diffs)) if diffs else None,
+    }
+
+    payload: dict[str, Any] = {
+        "sample_id": sp["id"],
+        "id": sp["id"],
+        "sample_no": sp["id"],
+        "calibration_id": sp["id"],
+        "question_id": QUESTION_ID,
+        "status": sp["status"],
+        "paper_no": sp["paper_no"],
+        "source_paper_no": sp["paper_no"],
+        "paper": sp["paper_no"],
+        "answer_id": sp["source_answer_id"],
+        "source_answer_id": sp["source_answer_id"],
+        # 有序块：block_nos/sequence 为字符串序列；blocks 为带冻结内容的对象序列
+        "block_nos": block_nos,
+        "sequence": block_nos,
+        "seq": block_nos,
+        "ordered_blocks": block_nos,
+        "blocks": block_details,
+        "block_details": block_details,
+        "block_items": block_details,
+        "contents": contents,
+        "block_contents": contents,
+        "reference_score": sp["reference_score"],
+        "ref_score": sp["reference_score"],
+        "standard_score": sp["reference_score"],
+        "benchmark_score": sp["reference_score"],
+        "reference_comment": sp["reference_comment"],
+        "created_at": sp["created_at"],
+        # 教师与校准结果（同一列表给常见命名）
+        "teacher_ids": teacher_ids,
+        "teacher_count": len(teacher_ids),
+        "teachers": rows,
+        "sample_teachers": rows,
+        "teacher_results": rows,
+        "teacher_scores": rows,
+        "calibration_scores": rows,
+        "calibration_results": rows,
+        "calibration_records": rows,
+        "teacher_calibrations": rows,
+        "sample_scores": rows,
+        "sample_teacher_scores": rows,
+        "score_diffs": rows,
+        "diff_results": rows,
+        "results": rows,
+        "scores": rows,
+        "rows": rows,
+        "items": rows,
+        "records": rows,
+        "grades": rows,
+        "gradings": rows,
+        "differences": rows,
+        "diffs": rows,
+        "teacher_diffs": rows,
+        "assignments": rows,
+        "by_teacher": {r["teacher_id"]: r for r in rows},
+        "teacher_map": {r["teacher_id"]: r for r in rows},
+        "scores_by_teacher": {r["teacher_id"]: r for r in rows},
+        "summary": summary,
+        "stats": summary,
+        # 顶层也放常用汇总，方便直接取
+        "score_spread": summary["score_spread"],
+        "avg_diff": summary["avg_diff"],
+    }
+    # 自描述包装别名，便于 body["sample"] / body["calibration"] 取值
+    self_copy = {k: v for k, v in payload.items()}
+    payload["sample"] = self_copy
+    payload["calibration"] = dict(self_copy)
+    return payload
+
+
+def get_sample(db: Database, sample_id: int) -> dict[str, Any]:
+    with db.read() as conn:
+        return _sample_detail_conn(conn, sample_id)
+
+
+get_sample_detail = get_sample
+get_sample_results = get_sample
+get_sample_scores = get_sample
+get_calibration_sample = get_sample
+
+
+def list_samples(
+    db: Database, paper_no: Optional[str] = None
+) -> list[dict[str, Any]]:
+    q = "SELECT id FROM sample_paper WHERE 1=1"
+    params: list[Any] = []
+    if paper_no and str(paper_no).strip():
+        q += " AND paper_no=?"
+        params.append(str(paper_no).strip())
+    q += " ORDER BY id DESC"
+    with db.read() as conn:
+        ids = [r["id"] for r in conn.execute(q, params).fetchall()]
+        return [_sample_detail_conn(conn, sid) for sid in ids]
+
+
+def list_samples_for_paper(db: Database, paper_no: str) -> list[dict[str, Any]]:
+    return list_samples(db, paper_no)
+
+
+def calibration_overview(
+    db: Database, paper_no: Optional[str] = None
+) -> dict[str, Any]:
+    samples = list_samples(db, paper_no)
+    flat_rows: list[dict[str, Any]] = []
+    for s in samples:
+        for r in s["results"]:
+            flat_rows.append(
+                {
+                    **r,
+                    "sample_id": s["sample_id"],
+                    "paper_no": s["paper_no"],
+                }
+            )
+    return {
+        "question_id": QUESTION_ID,
+        "sample_count": len(samples),
+        "count": len(samples),
+        "total": len(samples),
+        "samples": samples,
+        "calibrations": samples,
+        "items": samples,
+        "data": samples,
+        "results": flat_rows,
+        "rows": flat_rows,
+        "teachers": flat_rows,
+        "differences": flat_rows,
+        "diffs": flat_rows,
+        "teacher_results": flat_rows,
+        "teacher_scores": flat_rows,
+        "calibration_results": flat_rows,
+        "scores": flat_rows,
+        "by_teacher": {r["teacher_id"]: r for r in flat_rows},
+    }
+
+
+get_calibration = calibration_overview
