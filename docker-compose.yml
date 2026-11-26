@@ -1,0 +1,26 @@
+services:
+  correction-api:
+    build: .
+    image: correction-service:1.0.0
+    container_name: correction-service
+    ports:
+      # 宿主机端口可用 HOST_PORT 覆盖，例如 HOST_PORT=18000 docker compose up
+      - "${HOST_PORT:-8000}:8000"
+    environment:
+      DB_PATH: /data/correction.db
+    volumes:
+      - correction-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  correction-data:
